@@ -1,0 +1,16 @@
+/*
+ * Overlay para o LED RGB da FRDM-KL25Z
+ * Os pinos PTB18 e PTB19 já existem no DTS base como gpio-leds.
+ * Aqui apenas adicionamos aliases nomeados para o projeto.
+ */
+
+/ {
+    aliases {
+        led-vermelho = &red_led;    /* PTB18 - já definido no DTS base */
+        led-verde    = &green_led;  /* PTB19 - já definido no DTS base */
+    };
+};
+
+&gpioe {
+    status = "okay";
+};
