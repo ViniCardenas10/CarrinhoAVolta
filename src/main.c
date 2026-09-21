@@ -2,160 +2,627 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/printk.h>
 #include <stdbool.h>
+#include <stdint.h>
 
-// ==========================================================
-// CONTROLE DE VELOCIDADE DO AVANÇO
-// ==========================================================
-//
-// DRIVE_SPEED_PERCENT:
-//     velocidade geral do carrinho.
-//
-// Exemplos:
-//     20 = aproximadamente 20%
-//     30 = aproximadamente 30%
-//     40 = aproximadamente 40%
-//
-// ATENÇÃO:
-// O PWM abaixo usa período de 20 ms com resolução de 1 ms.
-// Portanto, na prática, a resolução fica em aproximadamente
-// 5% por passo.
-//
-// ----------------------------------------------------------
 
-// Velocidade geral
-#define DRIVE_SPEED_PERCENT      40
+/* ==========================================================
+ *                 CONFIGURAÇÕES DO PROJETO
+ * ==========================================================
+ *
+ * Todos os parâmetros ajustáveis estão aqui.
+ *
+ * ========================================================== */
 
-// Correção individual das rodas.
-//
-// Se o carro estiver virando para a DIREITA:
-//     normalmente a roda esquerda está mais rápida.
-//     Nesse caso, reduza RIGHT_TRIM_PERCENT.
-//
-// Se o carro estiver virando para a ESQUERDA:
-//     normalmente a roda direita está mais rápida.
-//     Nesse caso, reduza LEFT_TRIM_PERCENT.
-//
-// Exemplos:
-//
-//    0 / 0   -> sem correção
-//    0 / -5  -> reduz a roda direita
-//   -5 / 0   -> reduz a roda esquerda
-//
-// ----------------------------------------------------------
 
-#define LEFT_TRIM_PERCENT         -3
-#define RIGHT_TRIM_PERCENT        0
+/* ==========================================================
+ * VELOCIDADE DO AVANÇO
+ * ========================================================== */
 
-// Período do PWM
-#define DRIVE_PWM_PERIOD_MS      20
+/*
+ * Velocidade geral do carrinho.
+ *
+ * 20 -> mais lento
+ * 30 -> lento
+ * 40 -> referência
+ * 50 -> mais rápido
+ * 70 -> configuração atual
+ */
+#define DRIVE_SPEED_PERCENT       70
 
-// ==========================================================
-// DEFINIÇÕES DE PINOS
-// ==========================================================
+/*
+ * Correção individual das rodas.
+ *
+ * Se o carrinho estiver desviando para a DIREITA:
+ *
+ * LEFT_TRIM_PERCENT    0
+ * RIGHT_TRIM_PERCENT  -5
+ *
+ * Se estiver desviando para a ESQUERDA:
+ *
+ * LEFT_TRIM_PERCENT   -5
+ * RIGHT_TRIM_PERCENT   0
+ */
+#define LEFT_TRIM_PERCENT          0
+#define RIGHT_TRIM_PERCENT         0
 
-// Ultrassom - Porta E
-#define ECHO_PIN 20
-#define TRIG_PIN 21
+/*
+ * Período do PWM do avanço.
+ */
+#define DRIVE_PWM_PERIOD_MS       10
 
-// Ponte H - Porta B
-#define OUT1_PIN 0
-#define OUT2_PIN 1
-#define OUT3_PIN 2
-#define OUT4_PIN 3
 
-// Encoder óptico LM393 - Porta D
-#define ENC1_PIN 7
+/* ==========================================================
+ * VELOCIDADE DAS CURVAS
+ * ========================================================== */
 
-// LED verde
-#define GREEN_PIN 19
+/*
+ * Período total do PWM da curva.
+ */
+#define TURN_PERIOD_MS            10
 
-// LED vermelho
-#define LED_NODE DT_ALIAS(led2)
+/*
+ * Tempo que as rodas ficam ligadas dentro do período.
+ *
+ * 2 -> ~20%
+ * 3 -> ~30%
+ * 4 -> ~40%
+ * 5 -> ~50%
+ * 6 -> ~60%
+ *
+ * Quanto maior, mais rápida a curva.
+ */
+#define TURN_ON_MS                 4
+
+
+/* ==========================================================
+ * CURVA CONTROLADA PELO ENCODER
+ * ========================================================== */
+
+/*
+ * Quantidade de pulsos necessária para a curva.
+ *
+ * Esse valor deve ser calibrado para obter aproximadamente
+ * 90 graus.
+ */
+#define TURN_ENCODER_PULSES        5
+
+/*
+ * Tempo MÍNIMO que a curva deve durar.
+ *
+ * Mesmo se o encoder atingir os pulsos rapidamente,
+ * a curva não termina antes desse tempo.
+ */
+#define TURN_MIN_TIME_MS         1200
+
+/*
+ * Tempo MÁXIMO permitido para uma curva.
+ *
+ * Segurança caso o encoder pare de gerar pulsos.
+ */
+#define TURN_MAX_TIME_MS       10000
+
+/*
+ * Pausa depois de cada curva.
+ */
+#define TURN_PAUSE_MS           3000
+
+
+/* ==========================================================
+ * ULTRASSOM
+ * ========================================================== */
+
+/*
+ * Distância abaixo da qual há obstáculo.
+ */
+#define OBSTACLE_CM               20
+
+/*
+ * Tempo parado ao detectar obstáculo antes de iniciar
+ * a tentativa de desvio.
+ */
+#define OBSTACLE_INITIAL_PAUSE_MS 3000
+
+/*
+ * Tempo para estabilização após o freio.
+ */
+#define BRAKE_SETTLE_MS            300
+
+
+/* ==========================================================
+ * ENCODER HW-201
+ * ========================================================== */
+
+/*
+ * Tempo que o sinal precisa permanecer LOW para
+ * confirmar que voltou para a região preta.
+ *
+ * Valor encontrado experimentalmente.
+ */
+#define ENC_LOW_STABLE_MS          30
+
+/*
+ * Intervalo MÍNIMO absoluto entre dois pulsos aceitos.
+ *
+ * Isso evita que oscilações muito rápidas do HW-201
+ * sejam consideradas vários pulsos diferentes.
+ */
+#define ENC_MIN_PULSE_MS           30
+
+/*
+ * Período da thread que monitora o retorno ao preto.
+ */
+#define ENC_MONITOR_PERIOD_MS       1
+
+
+/* ==========================================================
+ * DISTÂNCIA DA RODA / ENCODER
+ * ========================================================== */
+
+/*
+ * Diâmetro da roda:
+ *
+ * 7 cm = 70 mm
+ */
+#define WHEEL_DIAMETER_MM         70
+
+/*
+ * Quantidade de regiões brancas por volta.
+ */
+#define ENCODER_TRACKS             8
+
+/*
+ * PI em ponto fixo.
+ *
+ * 3.14159
+ */
+#define PI_NUM                 314159
+#define PI_DEN                 100000
+
+
+/* ==========================================================
+ * PINOS
+ * ========================================================== */
+
+/*
+ * Ultrassom - Porta E
+ */
+#define ECHO_PIN                   20
+#define TRIG_PIN                   21
+
+/*
+ * Ponte H - Porta B
+ */
+#define OUT1_PIN                    0
+#define OUT2_PIN                    1
+#define OUT3_PIN                    2
+#define OUT4_PIN                    3
+
+/*
+ * Encoder HW-201 - PTD7
+ */
+#define ENC1_PIN                    7
+
+/*
+ * LED verde
+ */
+#define GREEN_PIN                  19
+
+/*
+ * LED vermelho
+ */
+#define LED_NODE                    DT_ALIAS(led2)
+
+
+/* ==========================================================
+ * ESTADOS DAS CURVAS
+ * ========================================================== */
+
+/*
+ * CURVA PARA A DIREITA
+ *
+ * Roda esquerda -> FRENTE
+ * Roda direita  -> RÉ
+ *
+ * O carrinho gira para a direita.
+ */
+#define TURN_STATE_RIGHT           0, 1, 0, 1
+
+
+/*
+ * RETORNO PARA A POSIÇÃO ORIGINAL
+ *
+ * Para desfazer a curva para a direita:
+ *
+ * Roda esquerda -> RÉ
+ * Roda direita  -> FRENTE
+ *
+ * Este estado é igual ao movimento da curva para esquerda.
+ */
+#define TURN_STATE_RETURN          1, 0, 1, 0
+
+
+/*
+ * CURVA PARA A ESQUERDA
+ *
+ * Roda esquerda -> RÉ
+ * Roda direita  -> FRENTE
+ */
+#define TURN_STATE_LEFT            1, 0, 1, 0
+
+
+/* ==========================================================
+ * LED
+ * ========================================================== */
+
 static const struct gpio_dt_spec led =
     GPIO_DT_SPEC_GET(LED_NODE, gpios);
 
-// ==========================================================
-// PARÂMETROS DAS CURVAS
-// ==========================================================
 
-// Tempo total aproximado da curva
-#define TURN_TIME_MS     3000
+/* ==========================================================
+ * ESTADO DO ENCODER
+ * ========================================================== */
 
-// PWM da curva
-#define TURN_PERIOD_MS   10
-#define TURN_ON_MS       2
+/*
+ * Contador TOTAL de regiões brancas detectadas.
+ *
+ * Inclui:
+ *
+ * - linha reta
+ * - curvas
+ * - retorno
+ */
+static volatile uint32_t encoder_count = 0;
 
-// Empurrão inicial para vencer o atrito
-#define TURN_KICK_MS     30
 
-// Distância considerada como obstáculo
-#define OBSTACLE_CM      30
+/*
+ * Contador somente durante linha reta.
+ */
+static volatile uint32_t encoder_reta_count = 0;
 
-// ==========================================================
-// ESTADOS DAS CURVAS
-// ==========================================================
-//
-// CURVA DIREITA
-//
-// Motor A gira para trás
-// Motor B fica freado
-//
-#define TURN_STATE_RIGHT   1, 0, 1, 1
 
-// ==========================================================
-// RETORNO PARA A POSIÇÃO ORIGINAL
-// ==========================================================
-//
-// Faz o movimento contrário da curva direita
-//
-#define TURN_STATE_RETURN  0, 1, 1, 1
+/*
+ * Indica se o carrinho está andando em linha reta.
+ */
+static volatile bool encoder_em_reta = false;
 
-// ==========================================================
-// CURVA ESQUERDA
-// ==========================================================
-//
-// Agora usa a outra roda
-//
-#define TURN_STATE_LEFT    1, 1, 0, 1
 
-// ==========================================================
-// ENCODER
-// ==========================================================
+/*
+ * true:
+ *     a região branca atual já foi contada.
+ *
+ * false:
+ *     uma nova região branca pode ser contada.
+ */
+static volatile bool aguardando_preto = false;
 
-static volatile uint32_t leituras_enc = 0;
 
-K_MSGQ_DEFINE(enc_q, sizeof(uint32_t), 128, 4);
+/*
+ * Momento do último pulso aceito.
+ *
+ * Usado pelo filtro ENC_MIN_PULSE_MS.
+ */
+static volatile int64_t ultimo_pulso_ms = -1000;
 
-static struct gpio_callback enc1_cb_data;
 
-// ==========================================================
-// ISR DO ENCODER
-// ==========================================================
+/*
+ * GPIO da Porta D.
+ *
+ * Global porque também é utilizado pelas threads.
+ */
+static const struct device *gpio_d_dev;
 
-void enc1_isr(const struct device *dev,
-              struct gpio_callback *cb,
-              uint32_t pins)
+
+/* ==========================================================
+ * EVENTO DO ENCODER
+ * ========================================================== */
+
+struct encoder_event {
+    uint32_t total;
+    uint32_t reta;
+};
+
+
+/* ==========================================================
+ * FILA DO ENCODER
+ * ========================================================== */
+
+K_MSGQ_DEFINE(
+    enc_q,
+    sizeof(struct encoder_event),
+    128,
+    4
+);
+
+
+/* ==========================================================
+ * CALLBACK
+ * ========================================================== */
+
+static struct gpio_callback enc_cb_data;
+
+
+/* ==========================================================
+ * CONVERSÃO DE PULSOS PARA DISTÂNCIA
+ * ========================================================== */
+
+/*
+ * Retorna a distância percorrida em milímetros.
+ *
+ * Para a sua roda:
+ *
+ * diâmetro = 70 mm
+ *
+ * circunferência ≈ 219,91 mm
+ *
+ * 8 pulsos por volta
+ *
+ * 1 pulso ≈ 27,49 mm
+ * 1 pulso ≈ 2,75 cm
+ */
+static uint32_t encoder_para_distancia_mm(
+    uint32_t pulsos)
 {
-    uint32_t n = ++leituras_enc;
+    /*
+     * Circunferência em micrômetros.
+     */
+    uint64_t circunferencia_um =
+        (
+            (uint64_t)WHEEL_DIAMETER_MM *
+            1000ULL *
+            PI_NUM
+        ) /
+        PI_DEN;
 
-    k_msgq_put(&enc_q, &n, K_NO_WAIT);
+    /*
+     * Distância total em micrômetros.
+     */
+    uint64_t distancia_um =
+        (
+            (uint64_t)pulsos *
+            circunferencia_um
+        ) /
+        ENCODER_TRACKS;
+
+    /*
+     * Retorna em milímetros.
+     */
+    return (uint32_t)(
+        distancia_um / 1000ULL
+    );
 }
 
-// ==========================================================
-// THREAD DE IMPRESSÃO DO ENCODER
-// ==========================================================
 
-static void plot_thread(void *p1, void *p2, void *p3)
+/* ==========================================================
+ * INTERRUPÇÃO DO ENCODER
+ * ========================================================== */
+
+/*
+ * Consideramos:
+ *
+ * PRETO  = LOW
+ * BRANCO = HIGH
+ *
+ * A borda de subida representa entrada na região branca.
+ */
+static void encoder_isr(
+    const struct device *dev,
+    struct gpio_callback *cb,
+    uint32_t pins)
 {
-    uint32_t n;
+    /*
+     * Se ainda estamos dentro da mesma região branca,
+     * ignoramos.
+     */
+    if (aguardando_preto) {
+        return;
+    }
+
+    /*
+     * Confirma que o pino realmente está HIGH.
+     */
+    if (gpio_pin_get_raw(dev, ENC1_PIN) != 1) {
+        return;
+    }
+
+    /*
+     * Tempo atual.
+     */
+    int64_t agora_ms = k_uptime_get();
+
+    /*
+     * ======================================================
+     * FILTRO DE TEMPO MÍNIMO ENTRE PULSOS
+     * ======================================================
+     */
+    if (
+        (agora_ms - ultimo_pulso_ms)
+        <
+        ENC_MIN_PULSE_MS
+    ) {
+        return;
+    }
+
+    /*
+     * Atualiza instante do último pulso aceito.
+     */
+    ultimo_pulso_ms = agora_ms;
+
+    /*
+     * Incrementa contador TOTAL.
+     */
+    encoder_count++;
+
+    /*
+     * Se estiver em linha reta,
+     * incrementa também o contador da reta.
+     */
+    if (encoder_em_reta) {
+        encoder_reta_count++;
+    }
+
+    /*
+     * Bloqueia novas contagens até retornar ao preto.
+     */
+    aguardando_preto = true;
+
+    /*
+     * Prepara evento para o Serial Monitor.
+     */
+    struct encoder_event event = {
+        .total = encoder_count,
+        .reta = encoder_reta_count
+    };
+
+    /*
+     * Não bloqueia dentro da ISR.
+     */
+    k_msgq_put(
+        &enc_q,
+        &event,
+        K_NO_WAIT
+    );
+}
+
+
+/* ==========================================================
+ * THREAD DE IMPRESSÃO
+ * ========================================================== */
+
+static void plot_thread(
+    void *p1,
+    void *p2,
+    void *p3)
+{
+    struct encoder_event event;
 
     while (1) {
 
-        k_msgq_get(&enc_q, &n, K_FOREVER);
+        /*
+         * Aguarda novo pulso.
+         */
+        k_msgq_get(
+            &enc_q,
+            &event,
+            K_FOREVER
+        );
 
-        printk("%u\n", (unsigned int)n);
+        /*
+         * Distância TOTAL.
+         */
+        uint32_t distancia_total_mm =
+            encoder_para_distancia_mm(
+                event.total
+            );
+
+        /*
+         * Distância somente em linha reta.
+         */
+        uint32_t distancia_reta_mm =
+            encoder_para_distancia_mm(
+                event.reta
+            );
+
+        /*
+         * Total em centímetros.
+         */
+        uint32_t total_cm =
+            distancia_total_mm / 10;
+
+        uint32_t total_decimo =
+            distancia_total_mm % 10;
+
+        /*
+         * Reta em centímetros.
+         */
+        uint32_t reta_cm =
+            distancia_reta_mm / 10;
+
+        uint32_t reta_decimo =
+            distancia_reta_mm % 10;
+
+        /*
+         * Mostra no Serial Monitor.
+         */
+        printk(
+            "Encoder: %u | "
+            "Reta: %u | "
+            "Distancia total: %u.%u cm | "
+            "Distancia reta: %u.%u cm\n",
+
+            (unsigned int)event.total,
+
+            (unsigned int)event.reta,
+
+            (unsigned int)total_cm,
+            (unsigned int)total_decimo,
+
+            (unsigned int)reta_cm,
+            (unsigned int)reta_decimo
+        );
     }
 }
+
+
+/* ==========================================================
+ * THREAD DE MONITORAMENTO DO HW-201
+ * ========================================================== */
+
+static void encoder_monitor_thread(
+    void *p1,
+    void *p2,
+    void *p3)
+{
+    while (1) {
+
+        if (aguardando_preto) {
+
+            int estado =
+                gpio_pin_get_raw(
+                    gpio_d_dev,
+                    ENC1_PIN
+                );
+
+            /*
+             * LOW = voltou para o preto.
+             */
+            if (estado == 0) {
+
+                /*
+                 * Confirma LOW por 30 ms.
+                 */
+                k_msleep(
+                    ENC_LOW_STABLE_MS
+                );
+
+                /*
+                 * Lê novamente.
+                 */
+                estado =
+                    gpio_pin_get_raw(
+                        gpio_d_dev,
+                        ENC1_PIN
+                    );
+
+                /*
+                 * Se continua LOW,
+                 * libera nova contagem.
+                 */
+                if (estado == 0) {
+                    aguardando_preto = false;
+                }
+            }
+        }
+
+        k_msleep(
+            ENC_MONITOR_PERIOD_MS
+        );
+    }
+}
+
+
+/* ==========================================================
+ * THREADS
+ * ========================================================== */
 
 K_THREAD_DEFINE(
     plot_tid,
@@ -169,185 +636,360 @@ K_THREAD_DEFINE(
     0
 );
 
-// ==========================================================
-// PONTE H
-// ==========================================================
+K_THREAD_DEFINE(
+    encoder_monitor_tid,
+    1024,
+    encoder_monitor_thread,
+    NULL,
+    NULL,
+    NULL,
+    7,
+    0,
+    0
+);
 
-static void ponte_h(const struct device *dev,
-                    int o1,
-                    int o2,
-                    int o3,
-                    int o4)
+
+/* ==========================================================
+ * PONTE H
+ * ========================================================== */
+
+static void ponte_h(
+    const struct device *dev,
+    int o1,
+    int o2,
+    int o3,
+    int o4)
 {
-    gpio_pin_set(dev, OUT1_PIN, o1);
-    gpio_pin_set(dev, OUT2_PIN, o2);
-    gpio_pin_set(dev, OUT3_PIN, o3);
-    gpio_pin_set(dev, OUT4_PIN, o4);
+    gpio_pin_set(
+        dev,
+        OUT1_PIN,
+        o1
+    );
+
+    gpio_pin_set(
+        dev,
+        OUT2_PIN,
+        o2
+    );
+
+    gpio_pin_set(
+        dev,
+        OUT3_PIN,
+        o3
+    );
+
+    gpio_pin_set(
+        dev,
+        OUT4_PIN,
+        o4
+    );
 }
 
-// ==========================================================
-// LED VERMELHO
-// ==========================================================
 
-static void led_vermelho(const struct device *gpio_b_dev)
+/* ==========================================================
+ * LED VERMELHO
+ * ========================================================== */
+
+static void led_vermelho(
+    const struct device *gpio_b_dev)
 {
-    // Vermelho ligado
-    gpio_pin_set_dt(&led, 1);
+    gpio_pin_set_dt(
+        &led,
+        1
+    );
 
-    // Verde desligado
-    gpio_pin_set(gpio_b_dev, GREEN_PIN, 0);
+    gpio_pin_set(
+        gpio_b_dev,
+        GREEN_PIN,
+        0
+    );
 }
 
-// ==========================================================
-// LED VERDE
-// ==========================================================
 
-static void led_verde(const struct device *gpio_b_dev)
+/* ==========================================================
+ * LED VERDE
+ * ========================================================== */
+
+static void led_verde(
+    const struct device *gpio_b_dev)
 {
-    // Vermelho desligado
-    gpio_pin_set_dt(&led, 0);
+    gpio_pin_set_dt(
+        &led,
+        0
+    );
 
-    // Verde ligado
-    gpio_pin_set(gpio_b_dev, GREEN_PIN, 1);
+    gpio_pin_set(
+        gpio_b_dev,
+        GREEN_PIN,
+        1
+    );
 }
 
-// ==========================================================
-// LED AMARELO
-// ==========================================================
-//
-// Assume que vermelho + verde acesos = amarelo.
-//
 
-static void led_amarelo(const struct device *gpio_b_dev)
+/* ==========================================================
+ * LED AMARELO
+ * ========================================================== */
+
+static void led_amarelo(
+    const struct device *gpio_b_dev)
 {
-    // Vermelho ligado
-    gpio_pin_set_dt(&led, 1);
+    /*
+     * Vermelho + verde ligados.
+     */
+    gpio_pin_set_dt(
+        &led,
+        1
+    );
 
-    // Verde ligado
-    gpio_pin_set(gpio_b_dev, GREEN_PIN, 1);
+    gpio_pin_set(
+        gpio_b_dev,
+        GREEN_PIN,
+        1
+    );
 }
 
-// ==========================================================
-// LED DESLIGADO
-// ==========================================================
 
-static void leds_desligados(const struct device *gpio_b_dev)
+/* ==========================================================
+ * LED DESLIGADO
+ * ========================================================== */
+
+static void leds_desligados(
+    const struct device *gpio_b_dev)
 {
-    gpio_pin_set_dt(&led, 0);
-    gpio_pin_set(gpio_b_dev, GREEN_PIN, 0);
+    gpio_pin_set_dt(
+        &led,
+        0
+    );
+
+    gpio_pin_set(
+        gpio_b_dev,
+        GREEN_PIN,
+        0
+    );
 }
 
-// ==========================================================
-// CALCULA A VELOCIDADE DA RODA
-// ==========================================================
 
-static int calcular_velocidade(int velocidade_base,
-                               int correcao)
+/* ==========================================================
+ * LIMITA VELOCIDADE
+ * ========================================================== */
+
+static int limitar_velocidade(
+    int valor)
 {
-    int velocidade = velocidade_base + correcao;
-
-    if (velocidade < 0) {
-        velocidade = 0;
+    if (valor < 0) {
+        return 0;
     }
 
-    if (velocidade > 100) {
-        velocidade = 100;
+    if (valor > 100) {
+        return 100;
     }
 
-    return velocidade;
+    return valor;
 }
 
-// ==========================================================
-// MEDIÇÃO DO ULTRASSOM
-// ==========================================================
 
-static uint32_t medir_distancia_cm(const struct device *gpio_e_dev)
+/* ==========================================================
+ * MEDIÇÃO DO ULTRASSOM
+ * ========================================================== */
+
+static uint32_t medir_distancia_cm(
+    const struct device *gpio_e_dev)
 {
     uint32_t timeout = 100000;
     uint32_t distance_cm = 999;
 
-    // ------------------------------------------------------
-    // TRIGGER
-    // ------------------------------------------------------
-
-    gpio_pin_set(gpio_e_dev, TRIG_PIN, 1);
+    /*
+     * Trigger.
+     */
+    gpio_pin_set(
+        gpio_e_dev,
+        TRIG_PIN,
+        1
+    );
 
     k_busy_wait(10);
 
-    gpio_pin_set(gpio_e_dev, TRIG_PIN, 0);
+    gpio_pin_set(
+        gpio_e_dev,
+        TRIG_PIN,
+        0
+    );
 
-    // ------------------------------------------------------
-    // ESPERA ECHO SUBIR
-    // ------------------------------------------------------
-
-    while (gpio_pin_get(gpio_e_dev, ECHO_PIN) == 0 &&
-           timeout > 0) {
+    /*
+     * Espera Echo subir.
+     */
+    while (
+        gpio_pin_get(
+            gpio_e_dev,
+            ECHO_PIN
+        ) == 0 &&
+        timeout > 0
+    ) {
         timeout--;
     }
 
     if (timeout > 0) {
 
-        uint32_t start_time = k_cycle_get_32();
+        uint32_t start_time =
+            k_cycle_get_32();
 
         timeout = 100000;
 
-        // --------------------------------------------------
-        // ESPERA ECHO DESCER
-        // --------------------------------------------------
-
-        while (gpio_pin_get(gpio_e_dev, ECHO_PIN) == 1 &&
-               timeout > 0) {
+        /*
+         * Espera Echo descer.
+         */
+        while (
+            gpio_pin_get(
+                gpio_e_dev,
+                ECHO_PIN
+            ) == 1 &&
+            timeout > 0
+        ) {
             timeout--;
         }
 
         if (timeout > 0) {
 
-            uint32_t end_time = k_cycle_get_32();
+            uint32_t end_time =
+                k_cycle_get_32();
 
             uint32_t duration_us =
                 k_cyc_to_us_floor32(
                     end_time - start_time
                 );
 
-            distance_cm = duration_us / 58;
+            /*
+             * Conversão aproximada.
+             */
+            distance_cm =
+                duration_us / 58;
         }
     }
 
     return distance_cm;
 }
 
-// ==========================================================
-// INDICA A DISTÂNCIA PELO LED
-// ==========================================================
 
-static void indicar_distancia(const struct device *gpio_b_dev,
-                              uint32_t distance_cm)
+/* ==========================================================
+ * INDICA DISTÂNCIA PELO LED
+ * ========================================================== */
+
+static void indicar_distancia(
+    const struct device *gpio_b_dev,
+    uint32_t distance_cm)
 {
-    if (distance_cm < OBSTACLE_CM) {
+    if (
+        distance_cm <
+        OBSTACLE_CM
+    ) {
 
-        led_vermelho(gpio_b_dev);
+        led_vermelho(
+            gpio_b_dev
+        );
 
     } else {
 
-        led_verde(gpio_b_dev);
+        led_verde(
+            gpio_b_dev
+        );
     }
 }
 
-// ==========================================================
-// EXECUTA UMA CURVA
-// ==========================================================
-//
-// Durante a curva:
-//     LED amarelo
-//
-// Depois da curva:
-//     freia
-//     mede
-//     LED vermelho ou verde
-//     espera 3 segundos
-//
-// Retorna a distância encontrada.
-//
+
+/* ==========================================================
+ * SINCRONIZA O ENCODER ANTES DE UMA CURVA
+ * ========================================================== */
+
+/*
+ * Evita que o estado do HW-201 no instante em que a
+ * curva começa cause uma contagem indevida.
+ */
+static void sincronizar_encoder_antes_da_curva(void)
+{
+    /*
+     * Desabilita temporariamente a interrupção.
+     */
+    gpio_pin_interrupt_configure(
+        gpio_d_dev,
+        ENC1_PIN,
+        GPIO_INT_DISABLE
+    );
+
+    /*
+     * Lê o estado atual.
+     */
+    int estado =
+        gpio_pin_get_raw(
+            gpio_d_dev,
+            ENC1_PIN
+        );
+
+    /*
+     * ------------------------------------------------------
+     * SENSOR NO BRANCO
+     * ------------------------------------------------------
+     */
+    if (estado == 1) {
+
+        /*
+         * Já estamos sobre uma região branca.
+         * Essa região não será contada.
+         */
+        aguardando_preto = true;
+
+    } else {
+
+        /*
+         * Sensor no PRETO.
+         */
+        aguardando_preto = true;
+
+        /*
+         * Confirma estabilidade por 30 ms.
+         */
+        k_msleep(
+            ENC_LOW_STABLE_MS
+        );
+
+        /*
+         * Confirma novamente.
+         */
+        estado =
+            gpio_pin_get_raw(
+                gpio_d_dev,
+                ENC1_PIN
+            );
+
+        if (estado == 0) {
+
+            /*
+             * Realmente está no preto.
+             */
+            aguardando_preto = false;
+
+        } else {
+
+            /*
+             * Ainda está no branco.
+             */
+            aguardando_preto = true;
+        }
+    }
+
+    /*
+     * Reativa interrupção.
+     */
+    gpio_pin_interrupt_configure(
+        gpio_d_dev,
+        ENC1_PIN,
+        GPIO_INT_EDGE_RISING
+    );
+}
+
+
+/* ==========================================================
+ * EXECUTA CURVA CONTROLADA PELO ENCODER
+ * ========================================================== */
 
 static uint32_t executar_curva(
     const struct device *gpio_b_dev,
@@ -357,35 +999,97 @@ static uint32_t executar_curva(
     int o3,
     int o4)
 {
-    // ======================================================
-    // LED AMARELO
-    // ======================================================
+    /*
+     * Não estamos andando em linha reta.
+     */
+    encoder_em_reta = false;
 
-    led_amarelo(gpio_b_dev);
+    /*
+     * Sincroniza o HW-201.
+     */
+    sincronizar_encoder_antes_da_curva();
 
-    // ======================================================
-    // EMPURRÃO INICIAL
-    // ======================================================
+    /*
+     * Guarda a contagem no início.
+     */
+    uint32_t encoder_inicial =
+        encoder_count;
 
-    ponte_h(
-        gpio_b_dev,
-        o1,
-        o2,
-        o3,
-        o4
+    /*
+     * LED AMARELO durante a curva.
+     */
+    led_amarelo(
+        gpio_b_dev
     );
 
-    k_msleep(TURN_KICK_MS);
+    /*
+     * Marca começo da curva.
+     */
+    int64_t inicio =
+        k_uptime_get();
 
-    // ======================================================
-    // EXECUÇÃO DA CURVA
-    // ======================================================
+    /*
+     * ======================================================
+     * CURVA
+     * ======================================================
+     *
+     * Para terminar:
+     *
+     * 1) tempo >= TURN_MIN_TIME_MS
+     *
+     * E
+     *
+     * 2) pulsos >= TURN_ENCODER_PULSES
+     *
+     * TURN_MAX_TIME_MS é apenas uma proteção.
+     */
+    while (1) {
 
-    int64_t t0 = k_uptime_get();
+        /*
+         * Tempo decorrido.
+         */
+        int64_t tempo_decorrido =
+            k_uptime_get() -
+            inicio;
 
-    while ((k_uptime_get() - t0) < TURN_TIME_MS) {
+        /*
+         * Pulsos utilizados na curva.
+         */
+        uint32_t pulsos =
+            encoder_count -
+            encoder_inicial;
 
-        // Motores ligados
+        /*
+         * Critério normal.
+         */
+        if (
+            tempo_decorrido >=
+            TURN_MIN_TIME_MS
+            &&
+            pulsos >=
+            TURN_ENCODER_PULSES
+        ) {
+            break;
+        }
+
+        /*
+         * Proteção.
+         */
+        if (
+            tempo_decorrido >=
+            TURN_MAX_TIME_MS
+        ) {
+
+            printk(
+                "AVISO: limite maximo da curva atingido!\n"
+            );
+
+            break;
+        }
+
+        /*
+         * Liga as duas rodas.
+         */
         ponte_h(
             gpio_b_dev,
             o1,
@@ -394,9 +1098,13 @@ static uint32_t executar_curva(
             o4
         );
 
-        k_msleep(TURN_ON_MS);
+        k_msleep(
+            TURN_ON_MS
+        );
 
-        // Motores desligados
+        /*
+         * Desliga as duas rodas.
+         */
         ponte_h(
             gpio_b_dev,
             0,
@@ -406,14 +1114,16 @@ static uint32_t executar_curva(
         );
 
         k_msleep(
-            TURN_PERIOD_MS - TURN_ON_MS
+            TURN_PERIOD_MS -
+            TURN_ON_MS
         );
     }
 
-    // ======================================================
-    // FREIO
-    // ======================================================
-
+    /*
+     * ======================================================
+     * FREIO
+     * ======================================================
+     */
     ponte_h(
         gpio_b_dev,
         1,
@@ -422,83 +1132,144 @@ static uint32_t executar_curva(
         1
     );
 
-    k_msleep(300);
+    k_msleep(
+        BRAKE_SETTLE_MS
+    );
 
-    // ======================================================
-    // MEDE A DISTÂNCIA
-    // ======================================================
+    /*
+     * Pulsos usados na curva.
+     */
+    uint32_t pulsos_curva =
+        encoder_count -
+        encoder_inicial;
 
+    /*
+     * Tempo efetivo.
+     */
+    int64_t tempo_curva =
+        k_uptime_get() -
+        inicio;
+
+    /*
+     * Distância correspondente aos pulsos da curva.
+     */
+    uint32_t distancia_curva_mm =
+        encoder_para_distancia_mm(
+            pulsos_curva
+        );
+
+    uint32_t distancia_curva_cm =
+        distancia_curva_mm / 10;
+
+    uint32_t distancia_curva_decimo =
+        distancia_curva_mm % 10;
+
+    /*
+     * Informações da curva no Serial Monitor.
+     */
+    printk(
+        "Curva finalizada | "
+        "Pulsos: %u | "
+        "Tempo: %lld ms | "
+        "Distancia encoder: %u.%u cm | "
+        "Encoder total: %u\n",
+
+        (unsigned int)pulsos_curva,
+
+        (long long)tempo_curva,
+
+        (unsigned int)distancia_curva_cm,
+        (unsigned int)distancia_curva_decimo,
+
+        (unsigned int)encoder_count
+    );
+
+    /*
+     * ======================================================
+     * MEDE DISTÂNCIA NA NOVA DIREÇÃO
+     * ======================================================
+     */
     uint32_t distance_cm =
-        medir_distancia_cm(gpio_e_dev);
+        medir_distancia_cm(
+            gpio_e_dev
+        );
 
-    // ======================================================
-    // LED INDICA SE HÁ OBSTÁCULO
-    // ======================================================
-
+    /*
+     * ======================================================
+     * LED
+     * ======================================================
+     */
     indicar_distancia(
         gpio_b_dev,
         distance_cm
     );
 
-    // ======================================================
-    // PAUSA DE 3 SEGUNDOS
-    // ======================================================
-
-    k_msleep(3000);
+    /*
+     * ======================================================
+     * PAUSA
+     * ======================================================
+     */
+    k_msleep(
+        TURN_PAUSE_MS
+    );
 
     return distance_cm;
 }
 
-// ==========================================================
-// ANDAR PARA FRENTE
-// ==========================================================
-//
-// Usa PWM independente para cada roda.
-//
-// LEFT_SPEED  = velocidade da esquerda
-// RIGHT_SPEED = velocidade da direita
-//
-// Isso permite compensar o desbalanceamento.
-//
-static void andar_para_frente(const struct device *dev)
-{
-    // ======================================================
-    // CALCULA VELOCIDADE DE CADA RODA
-    // ======================================================
 
+/* ==========================================================
+ * ANDAR PARA FRENTE
+ * ========================================================== */
+
+static void andar_para_frente(
+    const struct device *dev)
+{
+    /*
+     * Habilita a contagem da linha reta.
+     */
+    encoder_em_reta = true;
+
+    /*
+     * Velocidade da esquerda.
+     */
     int left_percent =
-        calcular_velocidade(
-            DRIVE_SPEED_PERCENT,
+        limitar_velocidade(
+            DRIVE_SPEED_PERCENT +
             LEFT_TRIM_PERCENT
         );
 
+    /*
+     * Velocidade da direita.
+     */
     int right_percent =
-        calcular_velocidade(
-            DRIVE_SPEED_PERCENT,
+        limitar_velocidade(
+            DRIVE_SPEED_PERCENT +
             RIGHT_TRIM_PERCENT
         );
 
-    // ======================================================
-    // CONVERTE % PARA TEMPO LIGADO
-    // ======================================================
-
+    /*
+     * Converte porcentagem em tempo ligado.
+     */
     int left_on_ms =
-        (DRIVE_PWM_PERIOD_MS * left_percent) / 100;
+        (
+            DRIVE_PWM_PERIOD_MS *
+            left_percent
+        ) / 100;
 
     int right_on_ms =
-        (DRIVE_PWM_PERIOD_MS * right_percent) / 100;
+        (
+            DRIVE_PWM_PERIOD_MS *
+            right_percent
+        ) / 100;
 
-    // ======================================================
-    // PWM
-    // ======================================================
-
-    for (int t = 0;
-         t < DRIVE_PWM_PERIOD_MS;
-         t++) {
-
-        // --------------------------------------------------
-        // ESTADO DAS RODAS
-        // --------------------------------------------------
+    /*
+     * PWM.
+     */
+    for (
+        int t = 0;
+        t < DRIVE_PWM_PERIOD_MS;
+        t++
+    ) {
 
         bool left_on =
             (t < left_on_ms);
@@ -506,39 +1277,25 @@ static void andar_para_frente(const struct device *dev)
         bool right_on =
             (t < right_on_ms);
 
-        // --------------------------------------------------
-        // RODA ESQUERDA
-        // --------------------------------------------------
-
-        int out1 = 0;
-        int out2 = left_on ? 1 : 0;
-
-        // --------------------------------------------------
-        // RODA DIREITA
-        // --------------------------------------------------
-
-        int out3 = right_on ? 1 : 0;
-        int out4 = 0;
-
-        // --------------------------------------------------
-        // APLICA NA PONTE H
-        // --------------------------------------------------
-
+        /*
+         * As duas rodas para frente.
+         */
         ponte_h(
             dev,
-            out1,
-            out2,
-            out3,
-            out4
+
+            0,
+            left_on ? 1 : 0,
+
+            right_on ? 1 : 0,
+            0
         );
 
         k_msleep(1);
     }
 
-    // ------------------------------------------------------
-    // DESLIGA
-    // ------------------------------------------------------
-
+    /*
+     * Desliga.
+     */
     ponte_h(
         dev,
         0,
@@ -548,75 +1305,117 @@ static void andar_para_frente(const struct device *dev)
     );
 }
 
-// ==========================================================
-// MAIN
-// ==========================================================
+
+/* ==========================================================
+ * MAIN
+ * ========================================================== */
 
 int main(void)
 {
-    // ======================================================
-    // VERIFICA LED
-    // ======================================================
-
-    if (!device_is_ready(led.port)) {
+    /*
+     * ======================================================
+     * LED
+     * ======================================================
+     */
+    if (
+        !device_is_ready(
+            led.port
+        )
+    ) {
         return 0;
     }
 
-    // ======================================================
-    // DISPOSITIVOS GPIO
-    // ======================================================
+
+    /*
+     * ======================================================
+     * DISPOSITIVOS GPIO
+     * ======================================================
+     */
 
     const struct device *gpio_b_dev =
-        DEVICE_DT_GET(DT_NODELABEL(gpiob));
+        DEVICE_DT_GET(
+            DT_NODELABEL(
+                gpiob
+            )
+        );
 
-    const struct device *gpio_d_dev =
-        DEVICE_DT_GET(DT_NODELABEL(gpiod));
+    gpio_d_dev =
+        DEVICE_DT_GET(
+            DT_NODELABEL(
+                gpiod
+            )
+        );
 
     const struct device *gpio_e_dev =
-        DEVICE_DT_GET(DT_NODELABEL(gpioe));
+        DEVICE_DT_GET(
+            DT_NODELABEL(
+                gpioe
+            )
+        );
 
-    // ======================================================
-    // VERIFICA DISPOSITIVOS
-    // ======================================================
 
-    if (!device_is_ready(gpio_b_dev) ||
-        !device_is_ready(gpio_d_dev) ||
-        !device_is_ready(gpio_e_dev)) {
+    /*
+     * ======================================================
+     * VERIFICA DISPOSITIVOS
+     * ======================================================
+     */
+
+    if (
+        !device_is_ready(
+            gpio_b_dev
+        )
+        ||
+        !device_is_ready(
+            gpio_d_dev
+        )
+        ||
+        !device_is_ready(
+            gpio_e_dev
+        )
+    ) {
 
         while (1) {
 
-            gpio_pin_toggle_dt(&led);
+            gpio_pin_toggle_dt(
+                &led
+            );
 
             k_msleep(50);
         }
     }
 
-    // ======================================================
-    // CONFIGURAÇÃO DOS PINOS
-    // ======================================================
 
-    // ------------------------------------------------------
-    // LED VERMELHO
-    // ------------------------------------------------------
+    /*
+     * ======================================================
+     * LED VERMELHO
+     * ======================================================
+     */
 
     gpio_pin_configure_dt(
         &led,
         GPIO_OUTPUT_INACTIVE
     );
 
-    // ------------------------------------------------------
-    // LED VERDE
-    // ------------------------------------------------------
+
+    /*
+     * ======================================================
+     * LED VERDE
+     * ======================================================
+     */
 
     gpio_pin_configure(
         gpio_b_dev,
         GREEN_PIN,
-        GPIO_OUTPUT_INACTIVE | GPIO_ACTIVE_LOW
+        GPIO_OUTPUT_INACTIVE |
+        GPIO_ACTIVE_LOW
     );
 
-    // ------------------------------------------------------
-    // ULTRASSOM
-    // ------------------------------------------------------
+
+    /*
+     * ======================================================
+     * ULTRASSOM
+     * ======================================================
+     */
 
     gpio_pin_configure(
         gpio_e_dev,
@@ -630,9 +1429,12 @@ int main(void)
         GPIO_INPUT
     );
 
-    // ------------------------------------------------------
-    // PONTE H
-    // ------------------------------------------------------
+
+    /*
+     * ======================================================
+     * PONTE H
+     * ======================================================
+     */
 
     gpio_pin_configure(
         gpio_b_dev,
@@ -658,72 +1460,201 @@ int main(void)
         GPIO_OUTPUT_INACTIVE
     );
 
-    // ------------------------------------------------------
-    // ENCODER
-    // ------------------------------------------------------
 
-    gpio_pin_configure(
-        gpio_d_dev,
-        ENC1_PIN,
-        GPIO_INPUT
-    );
+    /*
+     * ======================================================
+     * ENCODER HW-201
+     * ======================================================
+     */
 
-    // ======================================================
-    // INTERRUPÇÃO DO ENCODER
-    // ======================================================
+    int ret =
+        gpio_pin_configure(
+            gpio_d_dev,
+            ENC1_PIN,
+            GPIO_INPUT |
+            GPIO_PULL_UP
+        );
 
-    gpio_pin_interrupt_configure(
-        gpio_d_dev,
-        ENC1_PIN,
-        GPIO_INT_EDGE_TO_ACTIVE
-    );
+    if (ret < 0) {
+
+        printk(
+            "ERRO configurando PTD7: %d\n",
+            ret
+        );
+
+        return 0;
+    }
+
+
+    /*
+     * ======================================================
+     * INTERRUPÇÃO DO ENCODER
+     * ======================================================
+     */
+
+    ret =
+        gpio_pin_interrupt_configure(
+            gpio_d_dev,
+            ENC1_PIN,
+            GPIO_INT_EDGE_RISING
+        );
+
+    if (ret < 0) {
+
+        printk(
+            "ERRO configurando interrupcao do encoder: %d\n",
+            ret
+        );
+
+        return 0;
+    }
+
+
+    /*
+     * ======================================================
+     * CALLBACK
+     * ======================================================
+ */
 
     gpio_init_callback(
-        &enc1_cb_data,
-        enc1_isr,
+        &enc_cb_data,
+        encoder_isr,
         BIT(ENC1_PIN)
     );
 
-    gpio_add_callback(
-        gpio_d_dev,
-        &enc1_cb_data
+
+    /*
+     * ======================================================
+     * ADICIONA CALLBACK
+     * ======================================================
+ */
+
+    ret =
+        gpio_add_callback(
+            gpio_d_dev,
+            &enc_cb_data
+        );
+
+    if (ret < 0) {
+
+        printk(
+            "ERRO adicionando callback: %d\n",
+            ret
+        );
+
+        return 0;
+    }
+
+
+    /*
+     * ======================================================
+     * MENSAGEM INICIAL
+     * ======================================================
+ */
+
+    printk("\n");
+    printk("========================================\n");
+    printk("          CARRINHO FRDM-KL25Z\n");
+    printk("========================================\n");
+    printk("Encoder: HW-201\n");
+    printk("Entrada: PTD7\n");
+    printk("Filtro preto: %d ms\n",
+           ENC_LOW_STABLE_MS);
+    printk("Intervalo minimo entre pulsos: %d ms\n",
+           ENC_MIN_PULSE_MS);
+    printk("Pulsos por curva: %d\n",
+           TURN_ENCODER_PULSES);
+    printk("Tempo minimo da curva: %d ms\n",
+           TURN_MIN_TIME_MS);
+    printk("Tempo maximo da curva: %d ms\n",
+           TURN_MAX_TIME_MS);
+    printk("Velocidade reta: %d%%\n",
+           DRIVE_SPEED_PERCENT);
+    printk(
+        "Velocidade curva: %d%%\n",
+        (
+            TURN_ON_MS * 100
+        ) / TURN_PERIOD_MS
+    );
+    printk("Roda: %d mm de diametro\n",
+           WHEEL_DIAMETER_MM);
+    printk("Tracos brancos: %d\n",
+           ENCODER_TRACKS);
+    printk(
+        "Distancia por pulso: aproximadamente 2.75 cm\n"
+    );
+    printk("Obstaculo: %d cm\n",
+           OBSTACLE_CM);
+    printk("Primeira tentativa: DIREITA\n");
+    printk("Segunda tentativa: ESQUERDA\n");
+    printk("========================================\n");
+    printk("\n");
+
+
+    /*
+     * ======================================================
+     * ESTADO INICIAL
+     * ======================================================
+ */
+
+    encoder_count = 0;
+    encoder_reta_count = 0;
+    encoder_em_reta = false;
+    aguardando_preto = false;
+    ultimo_pulso_ms = -1000;
+
+    leds_desligados(
+        gpio_b_dev
     );
 
-    // ======================================================
-    // ESTADO INICIAL DOS LEDS
-    // ======================================================
 
-    leds_desligados(gpio_b_dev);
-
-    // ======================================================
-    // LOOP PRINCIPAL
-    // ======================================================
+    /*
+     * ======================================================
+     * LOOP PRINCIPAL
+     * ======================================================
+ */
 
     while (1) {
 
-        // --------------------------------------------------
-        // MEDE A DISTÂNCIA À FRENTE
-        // --------------------------------------------------
-
+        /*
+         * ==================================================
+         * MEDIR DISTÂNCIA
+         * ==================================================
+         */
         uint32_t distance_cm =
-            medir_distancia_cm(gpio_e_dev);
+            medir_distancia_cm(
+                gpio_e_dev
+            );
 
-        // ==================================================
-        // EXISTE OBSTÁCULO?
-        // ==================================================
 
-        if (distance_cm < OBSTACLE_CM) {
+        /*
+         * ==================================================
+         * EXISTE OBSTÁCULO?
+         * ==================================================
+         */
 
-            // ------------------------------------------------
-            // LED VERMELHO
-            // ------------------------------------------------
+        if (
+            distance_cm <
+            OBSTACLE_CM
+        ) {
 
-            led_vermelho(gpio_b_dev);
+            /*
+             * Não estamos em linha reta.
+             */
+            encoder_em_reta = false;
 
-            // ------------------------------------------------
-            // FREIA
-            // ------------------------------------------------
 
+            /*
+             * LED vermelho.
+             */
+            led_vermelho(
+                gpio_b_dev
+            );
+
+
+            /*
+             * Freia.
+             */
             ponte_h(
                 gpio_b_dev,
                 1,
@@ -732,12 +1663,20 @@ int main(void)
                 1
             );
 
-            // Aguarda 3 segundos
-            k_msleep(3000);
 
-            // =================================================
-            // 1. VIRA PARA A DIREITA
-            // =================================================
+            /*
+             * Pausa inicial.
+             */
+            k_msleep(
+                OBSTACLE_INITIAL_PAUSE_MS
+            );
+
+
+            /*
+             * =================================================
+             * 1. PRIMEIRA TENTATIVA: DIREITA
+             * =================================================
+             */
 
             distance_cm =
                 executar_curva(
@@ -746,16 +1685,26 @@ int main(void)
                     TURN_STATE_RIGHT
                 );
 
-            // =================================================
-            // 2. A DIREITA ESTÁ BLOQUEADA?
-            // =================================================
 
-            if (distance_cm < OBSTACLE_CM) {
+            /*
+             * =================================================
+             * 2. DIREITA BLOQUEADA?
+             * =================================================
+             */
 
-                // =================================================
-                // VOLTA PARA A POSIÇÃO ORIGINAL
-                // =================================================
+            if (
+                distance_cm <
+                OBSTACLE_CM
+            ) {
 
+                /*
+                 * ------------------------------------------------
+                 * RETORNA PARA A POSIÇÃO ORIGINAL
+                 * ------------------------------------------------
+                 *
+                 * O retorno usa o movimento oposto da curva
+                 * para a direita.
+                 */
                 distance_cm =
                     executar_curva(
                         gpio_b_dev,
@@ -763,10 +1712,12 @@ int main(void)
                         TURN_STATE_RETURN
                     );
 
-                // =================================================
-                // 3. VIRA PARA A ESQUERDA
-                // =================================================
 
+                /*
+                 * ------------------------------------------------
+                 * 3. SEGUNDA TENTATIVA: ESQUERDA
+                 * ------------------------------------------------
+                 */
                 distance_cm =
                     executar_curva(
                         gpio_b_dev,
@@ -774,22 +1725,29 @@ int main(void)
                         TURN_STATE_LEFT
                     );
 
-                // =================================================
-                // 4. A ESQUERDA TAMBÉM ESTÁ BLOQUEADA?
-                // =================================================
 
-                if (distance_cm < OBSTACLE_CM) {
+                /*
+                 * =================================================
+                 * 4. ESQUERDA TAMBÉM BLOQUEADA?
+                 * =================================================
+                 */
 
-                    // ------------------------------------------------
-                    // LED VERMELHO
-                    // ------------------------------------------------
+                if (
+                    distance_cm <
+                    OBSTACLE_CM
+                ) {
 
-                    led_vermelho(gpio_b_dev);
+                    /*
+                     * LED vermelho.
+                     */
+                    led_vermelho(
+                        gpio_b_dev
+                    );
 
-                    // ------------------------------------------------
-                    // PARA COMPLETAMENTE
-                    // ------------------------------------------------
 
+                    /*
+                     * Para.
+                     */
                     ponte_h(
                         gpio_b_dev,
                         1,
@@ -798,44 +1756,53 @@ int main(void)
                         1
                     );
 
-                    // ------------------------------------------------
-                    // FICA PARADO ENQUANTO ESTIVER BLOQUEADO
-                    // ------------------------------------------------
 
+                    /*
+                     * Espera até ficar livre.
+                     */
                     while (
-                        medir_distancia_cm(gpio_e_dev)
-                        < OBSTACLE_CM
+                        medir_distancia_cm(
+                            gpio_e_dev
+                        )
+                        <
+                        OBSTACLE_CM
                     ) {
+
+                        encoder_em_reta = false;
 
                         k_msleep(100);
                     }
 
                 } else {
 
-                    // ------------------------------------------------
-                    // ESQUERDA LIVRE
-                    // ------------------------------------------------
-
-                    led_verde(gpio_b_dev);
+                    /*
+                     * Esquerda livre.
+                     */
+                    led_verde(
+                        gpio_b_dev
+                    );
                 }
             }
 
-            // Se direita estiver livre, o carro continua
-            // na direção para a qual virou.
-
         } else {
 
-            // =================================================
-            // CAMINHO LIVRE
-            // =================================================
+            /*
+             * =================================================
+             * CAMINHO LIVRE
+             * =================================================
+             */
 
-            led_verde(gpio_b_dev);
+            led_verde(
+                gpio_b_dev
+            );
 
-            // ------------------------------------------------
-            // ANDA PARA FRENTE
-            // ------------------------------------------------
 
-            andar_para_frente(gpio_b_dev);
+            /*
+             * Anda para frente.
+             */
+            andar_para_frente(
+                gpio_b_dev
+            );
         }
     }
 
